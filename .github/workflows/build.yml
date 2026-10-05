@@ -1,0 +1,97 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      # 1) ولّد مشروع Flutter كامل في مجلد مؤقت
+      - name: Generate full Flutter project
+        run: flutter create --org com.example --project-name py_runner --platforms android _gen
+
+      # 2) انسخ ملفاتنا فوقه
+      - name: Copy our files
+        run: |
+          cp pubspec.yaml _gen/pubspec.yaml
+          cp lib/main.dart _gen/lib/main.dart
+          mkdir -p _gen/android/app/src/main/python
+          cp android/app/src/main/python/runner.py _gen/android/app/src/main/python/runner.py
+          rm -rf _gen/android/app/src/main/kotlin
+          mkdir -p _gen/android/app/src/main/kotlin/com/example/py_runner
+          cp android/app/src/main/kotlin/com/example/py_runner/MainActivity.kt _gen/android/app/src/main/kotlin/com/example/py_runner/MainActivity.kt
+
+      # 3) أضف Chaquopy لإعدادات Gradle
+      - name: Configure Chaquopy
+        working-directory: _gen/android
+        run: |
+          python3 - << 'PY'
+          import re, os
+
+          def read(p):
+              return open(p, encoding="utf-8").read()
+          def write(p, s):
+              open(p, "w", encoding="utf-8").write(s)
+
+          # settings.gradle(.kts): أضف plugin
+          for name in ("settings.gradle.kts", "settings.gradle"):
+              if os.path.exists(name):
+                  s = read(name)
+                  kts = name.endswith(".kts")
+                  line = ('    id("com.chaquo.python") version "16.0.0" apply false\n'
+                          if kts else
+                          '    id "com.chaquo.python" version "16.0.0" apply false\n')
+                  s = re.sub(r'(plugins\s*\{[^}]*?)(\n\})', lambda m: m.group(1) + "\n" + line.rstrip("\n") + m.group(2), s, count=1, flags=re.S)
+                  write(name, s)
+                  print("patched", name)
+                  break
+
+          # app/build.gradle(.kts)
+          for name in ("app/build.gradle.kts", "app/build.gradle"):
+              if os.path.exists(name):
+                  s = read(name)
+                  kts = name.endswith(".kts")
+                  plugin = ('    id("com.chaquo.python")\n' if kts else '    id "com.chaquo.python"\n')
+                  s = re.sub(r'(plugins\s*\{)', r'\1\n' + plugin.rstrip("\n"), s, count=1)
+                  # abiFilters + minSdk
+                  if kts:
+                      ndk = '        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }\n'
+                  else:
+                      ndk = '        ndk { abiFilters "arm64-v8a", "x86_64" }\n'
+                  s = re.sub(r'(defaultConfig\s*\{)', r'\1\n' + ndk.rstrip("\n"), s, count=1)
+                  s = re.sub(r'minSdk(Version)?\s*=?\s*[\w\.\(\)]+', 'minSdk = 24' if kts else 'minSdkVersion 24', s, count=1)
+                  chaq = ('\nchaquopy {\n    defaultConfig {\n        version = "3.11"\n    }\n}\n'
+                          if kts else
+                          '\nchaquopy {\n    defaultConfig {\n        version "3.11"\n    }\n}\n')
+                  s += chaq
+                  write(name, s)
+                  print("patched", name)
+                  break
+          PY
+          echo "----- app gradle -----"
+          cat app/build.gradle* || true
+
+      - run: flutter pub get
+        working-directory: _gen
+
+      - name: Build APK
+        run: flutter build apk --release --target-platform android-arm64
+        working-directory: _gen
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: py-runner-apk
+          path: _gen/build/app/outputs/flutter-apk/app-release.apk
